@@ -1,0 +1,11 @@
+# Source and working files that the live site does not use
+assets/images/
+assets/_unused/
+tools/
+asset-prompts.txt
+.claude/
+
+# OS clutter
+Thumbs.db
+desktop.ini
+.DS_Store
