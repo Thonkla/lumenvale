@@ -733,8 +733,10 @@ float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
 float noise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
   return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x),f.y);}
 float fbm(vec2 p){float s=0.,a=.5;for(int i=0;i<5;i++){s+=a*noise(p);p*=2.03;a*=.5;}return s;}
+// 4x4 ordered (Bayer) dither, 0..1
+float b2(vec2 a){a=floor(a);return fract(dot(a,vec2(.5,a.y*.75)));}
+float bayer(vec2 a){return b2(.5*a)*.25+b2(a);}
 
-// cover-fit the 16:9 artwork to the screen, with room for parallax
 vec2 cover(vec2 uv, vec2 off){
   vec2 p=uv-.5; float ca=uRes.x/uRes.y;
   if(ca>uImg) p.y*=uImg/ca; else p.x*=ca/uImg;
@@ -742,57 +744,82 @@ vec2 cover(vec2 uv, vec2 off){
 }
 vec4 tex(sampler2D s, vec2 uv){ return texture2D(s, clamp(uv,.001,.999)); }
 
-void main(){
-  vec2 uv=v;
-
-  // ----- dissolve mask (pixel grid + noise water line) -----
-  vec2 grid=floor(uRes/uCell);            // same block size on every screen
-  vec2 cell=floor(uv*grid)/grid;
-  float n=fbm(cell*vec2(5.,3.)+vec2(uTime*.05,uTime*.12));
-  float level=mix(-.22,1.28,uProg);
-  float h=uv.y+(n-.5)*.38;
-  float d=level-h;                       // > 0 : under water
-  float rnd=hash(cell*91.7+floor(uTime*8.));
-
-  // ripple near and below the surface
-  float under=smoothstep(0.,.12,d);
-  uv.x+=sin(uv.y*95.+uTime*2.2)*.0035*under;
-  uv.y+=sin(uv.x*40.+uTime*1.3)*.002*under;
-
-  // ----- 5 parallax layers -----
-  vec2 m=uMouse*vec2(-1.,-1.);
+// the full 5-layer scene with parallax and fog
+vec3 scene(vec2 uv){
+  vec2 m=-uMouse;
   vec3 c=tex(L1,cover(uv,m*.006)).rgb;
   vec4 s=tex(L2,cover(uv,m*.012+vec2(-.03,-.05))); c=mix(c,s.rgb,s.a);
   s=tex(L3,cover(uv,m*.02)); c=mix(c,s.rgb,s.a);
-
-  // fog between clouds and the island
-  vec2 fp=v*vec2(uRes.x/uRes.y,1.)*2.2;
+  vec2 fp=uv*vec2(uRes.x/uRes.y,1.)*2.2;
   vec2 q=vec2(fbm(fp+uTime*.03),fbm(fp+vec2(5.2,1.3)-uTime*.02));
   float f=fbm(fp+2.*q+vec2(uTime*.04,0.));
-  float band=smoothstep(.0,.45,v.y)*smoothstep(1.,.35,v.y);
-  vec3 fogc=mix(vec3(.25,.35,.55),vec3(.75,.85,1.),f);
-  c=1.-(1.-c)*(1.-fogc*f*band*.38);
-
+  float band=smoothstep(.0,.45,uv.y)*smoothstep(1.,.35,uv.y);
+  c=1.-(1.-c)*(1.-mix(vec3(.25,.35,.55),vec3(.75,.85,1.),f)*f*band*.38);
   s=tex(L4,cover(uv,m*.035)); c=mix(c,s.rgb,s.a);
   s=tex(L5,cover(uv,m*.06));  c=mix(c,s.rgb,s.a);
+  return c;
+}
+float luma(vec3 c){return dot(c,vec3(.299,.587,.114));}
 
-  // ----- water below the line -----
-  float gray=dot(c,vec3(.299,.587,.114));
-  float grain=hash(cell+uTime);
-  vec3 water=mix(vec3(.11,.12,.18),vec3(gray*.6)+vec3(.04,.05,.1),.6);
-  water+=grain*.045+step(.985,fract(v.y*140.+uTime*.2))*.035;
-  water*=1.-smoothstep(.0,.9,d)*.4;              // deeper = darker
-  vec3 col=mix(c,water,step(0.,d));
+void main(){
+  vec2 px=v*uRes;
+  vec2 big=floor(px/uCell);               // chunky blocks
+  vec2 small=floor(px/(uCell*.5));        // fine blocks for dither + sparkle
+  float p=uProg*uProg*(3.-2.*uProg);      // eased progress
+  float level=mix(-.25,1.3,p);
+  float t=uTime;
 
-  // ----- broken silver edge: pixels flake off around the line -----
-  float edge=1.-smoothstep(0.,.045,abs(d+.008));
-  float flake=step(1.-edge*edge*.7,rnd);
-  vec3 silver=vec3(.86,.9,1.)*(.7+.3*hash(cell*3.1));
-  col=mix(col,silver,flake*step(.05,edge));
-  col+=vec3(.6,.7,.9)*edge*.12;                   // soft glow on the line
+  // water line: blocky (for the mask) and smooth (for the foam highlight)
+  float nB=fbm(big*uCell/uRes*vec2(5.,3.)+vec2(t*.05,t*.1));
+  float nS=fbm(v*vec2(5.,3.)+vec2(t*.05,t*.1));
+  float d =level-(v.y+(nB-.5)*.38);       // > 0 : under water
+  float dS=level-(v.y+(nS-.5)*.38);
 
-  // fade into the page colour at the very end
-  col=mix(col,vec3(.027,.051,.122),smoothstep(.82,1.,uProg));
+  // dithered crossfade between image and water over a short band
+  float tr=clamp(d/.09+.35,0.,1.);
+  float under=step(bayer(small)+.001,tr);
+
+  // ripple the image near and under the surface
+  float deep=smoothstep(0.,.12,d);
+  vec2 uv=v;
+  uv.x+=sin(v.y*95.+t*2.2)*.0035*deep;
+  uv.y+=sin(v.x*40.+t*1.3)*.002*deep;
+  vec3 c=scene(uv);
+
+  // water: dark glassy body + mirrored reflection of the scene above
+  float ry=2.*level-v.y;
+  vec2 ruv=vec2(v.x+sin(v.y*60.+t*1.6)*.006+sin(v.y*170.-t*3.)*.002, ry);
+  vec3 refl=(ry>0.&&ry<1.)?scene(ruv):vec3(.1,.12,.2);
+  float rl=luma(refl)*smoothstep(0.,.18,ry)*smoothstep(1.,.85,ry);   // no hard edge where the mirror runs out
+  vec3 water=vec3(.09,.1,.16)+vec3(rl*.42,rl*.46,rl*.58)*(1.-smoothstep(0.,.55,d));
+  water+=vec3(.025,.035,.06)*fbm(v*vec2(3.,14.)+vec2(t*.08,t*.03)); // slow light bands in deep water
+  water+=step(.986,fract(v.y*150.+t*.15))*.03;                   // faint scan lines
+  water+=(hash(small+floor(t*12.))-.5)*.035;                      // grain
+  water*=1.-smoothstep(.0,.9,d)*.45;                              // deeper = darker
+  float tw=step(.996,hash(small*1.7+floor(t*5.)))*(1.-smoothstep(0.,.35,d));
+  water+=vec3(.75,.85,1.)*tw*.6;                                  // twinkles on the surface
+
+  vec3 col=mix(c,water,under);
+
+  // silver crest: blocks just around the line, brighter where the art is bright
+  float r=hash(small*91.7+floor(t*6.));
+  float crest=(1.-smoothstep(0.,.035,abs(d+.004)))*step(.35,r);
+  vec3 silver=vec3(.86,.91,1.)*(.62+.5*luma(c));
+  col=mix(col,silver,crest*.9);
+
+  // flakes breaking off and drifting up above the water
+  float above=-d;
+  vec2 rise=small+vec2(0.,floor(t*4.));                            // cells climb over time
+  float fr=hash(floor(rise*.5)*13.1);
+  float flakeP=(1.-smoothstep(0.,.14,above))*step(0.,above)*.45;
+  float flake=step(1.-flakeP,fr);
+  col=mix(col,silver*(.8+.2*r),flake*.85);
+
+  // smooth glowing foam line on top of the blocks
+  float foam=exp(-abs(dS)*260.)*.55+exp(-abs(dS)*40.)*.08;
+  col+=vec3(.7,.8,1.)*foam*step(.02,p);
+
+  col=mix(col,vec3(.027,.051,.122),smoothstep(.85,1.,uProg));    // hand off to the page
   gl_FragColor=vec4(col,1.);
 }`;
   const sh = (type, src) => {
